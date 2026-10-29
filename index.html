@@ -28,6 +28,10 @@
   button.on { border-color: var(--accent); color: var(--accent); }
   label { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 13px; }
   input[type=range] { flex: 1; accent-color: var(--accent); }
+  #txt { flex: 1 1 140px; min-width: 0; padding: 7px 10px; border-radius: 8px; border: 1px solid var(--line);
+    background: rgba(0,0,0,0.3); color: var(--text); font: inherit; }
+  #txt:focus { outline: none; border-color: var(--accent); }
+  [hidden] { display: none !important; }
 </style>
 </head>
 <body>
@@ -38,10 +42,15 @@
   <div class="row">
     <button id="mSheet" class="on">플래시 페이퍼</button>
     <button id="mFuse">도화선 → 스마일맨</button>
+    <button id="mText">도화선 → 텍스트</button>
   </div>
   <div class="row">
     <button id="light">불 붙이기</button>
     <button id="reset">리셋</button>  </div>
+  <div class="row" id="textRow" hidden>
+    <input id="txt" maxlength="24" value="FIRE" placeholder="태울 글자" autocomplete="off">
+    <button id="apply">적용</button>
+  </div>
   <label>속도 <input id="speed" type="range" min="0.3" max="2.5" step="0.05" value="1" autocomplete="off"></label>
 </div>
 <script>
@@ -61,12 +70,14 @@
   const FS = 5;                 // heat-field cell size in CSS px
   const H_STEP = 1 / 480;       // fixed CA step
   const TIME_SCALE = +new URLSearchParams(location.search).get('slow') || 1;   // ?slow=0.2 for slow motion
-  const MAT_SHEET = 1, MAT_STRIP = 2;
+  const MAT_SHEET = 1, MAT_STRIP = 2, MAT_TEXT = 3;
   // spread rate (ignitions/sec per neighbour) and burn duration per material
-  const RATE = [0, 300, 30];
-  const DUR = [0, 0.10, 0.24];
+  const RATE = [0, 300, 30, 220];
+  const DUR = [0, 0.10, 0.24, 0.14];
   // heat injected into the field per burning paper cell per second
-  const INJECT = [0, 10, 30];
+  const INJECT = [0, 10, 30, 14];
+  // heat jumping small gaps into letters (separate strokes, jamo): chance per burning cell per CA step
+  const JUMP = 0.03, JUMP_R = 10;
   // flame gas: rise speed (field cells/s), base cooling and noise-driven cooling (heat/s)
   const RISE = 120, COOL_BASE = 0.9, COOL_NOISE = 9, HEAT_MAX = 2.6;
 
@@ -173,7 +184,7 @@
     fimg = fx.createImageData(FW, FH); f32 = new Uint32Array(fimg.data.buffer);
     active = []; fresh = []; light = 0; heatSum = 0;
     drawRoom();
-    if (mode === 'sheet') buildSheet(); else buildFuse();
+    if (mode === 'sheet') buildSheet(); else if (mode === 'fuse') buildStickman(); else buildTextFuse();
   }
 
   function setCell(gx, gy, m, color) {
@@ -194,7 +205,57 @@
     }
   }
 
-  function buildFuse() {
+  let fuseText = 'FIRE';
+  const FONT = '"Malgun Gothic", "Apple SD Gothic Neo", "Noto Sans KR", sans-serif';
+
+  function buildTextFuse() {
+    const A = { x: W * 0.06, y: H * 0.9 }, B = { x: W * 0.3, y: H * 0.7 };
+    const text = fuseText.trim() || ' ';
+    // fit the text between the end of the slope and the right edge
+    const x0 = B.x + 12, avail = W * 0.95 - x0;
+    bgx.font = `900 100px ${FONT}`;
+    const fs = Math.max(24, Math.min(H * 0.34, 100 * avail / Math.max(1, bgx.measureText(text).width)));
+    bgx.font = `900 ${fs}px ${FONT}`;
+    const tw = bgx.measureText(text).width;
+    const C = { x: x0 + tw + 10, y: B.y };
+    drawPlank(A, B);
+    drawPlank(B, C);
+    // fuse strip: up the slope, then along the shelf right under the letters
+    stripAlong(A, B, 0);
+    stripAlong(B, C, Math.hypot(B.x - A.x, B.y - A.y));
+    fuseStart = A;
+    // letters cut from paper, standing on the fuse
+    const s = document.createElement('canvas'); s.width = GW; s.height = GH;
+    const g = s.getContext('2d');
+    g.font = `900 ${fs / CS}px ${FONT}`;
+    g.textBaseline = 'alphabetic';
+    g.fillText(text, x0 / CS, (B.y - 4) / CS);
+    const ink = g.getImageData(0, 0, GW, GH).data;
+    for (let i = 0; i < GW * GH; i++) {
+      if (ink[i * 4 + 3] < 110) continue;
+      const n = 1 + (Math.random() - 0.5) * 0.06;
+      setCell(i % GW, (i / GW) | 0, MAT_TEXT, rgba(clamp(248 * n, 0, 255) | 0, clamp(240 * n, 0, 255) | 0, clamp(222 * n, 0, 255) | 0));
+    }
+  }
+
+  // a wobbly strip of flash paper along segment P->Q (offset keeps the wobble continuous across segments)
+  function stripAlong(P, Q, offset) {
+    const dx = Q.x - P.x, dy = Q.y - P.y, len = Math.hypot(dx, dy), ux = dx / len, uy = dy / len;
+    const gx0 = Math.max(0, Math.floor((Math.min(P.x, Q.x) - 12) / CS)), gx1 = Math.min(GW, Math.ceil((Math.max(P.x, Q.x) + 12) / CS));
+    const gy0 = Math.max(0, Math.floor((Math.min(P.y, Q.y) - 12) / CS)), gy1 = Math.min(GH, Math.ceil((Math.max(P.y, Q.y) + 12) / CS));
+    for (let gy = gy0; gy < gy1; gy++) for (let gx = gx0; gx < gx1; gx++) {
+      const qx = (gx + 0.5) * CS - P.x, qy = (gy + 0.5) * CS - P.y;
+      const along = qx * ux + qy * uy, across = -qx * uy + qy * ux;
+      if (along < -8 || along > len + 8) continue;
+      const t = along + offset;
+      const half = 7 + Math.sin(t * 0.05) * 1.5 + Math.sin(t * 0.17) * 0.8;
+      if (Math.abs(across) > half) continue;
+      const shade = 1 + (Math.random() - 0.5) * 0.08;
+      setCell(gx, gy, MAT_STRIP, rgba(40 * shade | 0, clamp(178 * shade, 0, 255) | 0, clamp(230 * shade, 0, 255) | 0));
+    }
+  }
+
+  function buildStickman() {
     const A = { x: W * 0.1, y: H * 0.86 }, B = { x: W * 0.7, y: H * 0.42 };
     const card = { w: Math.min(150, W * 0.22), h: Math.min(180, H * 0.28) };
     card.x = B.x - card.w * 0.2; card.y = B.y - card.h + 10;
@@ -313,6 +374,10 @@
         const j = Y * GW + X;
         if (state[j] === 0 && mat[j] && Math.random() < prob[mat[j]][flam[j]][n]) ignite(j);
       }
+      if (mat[i] !== MAT_SHEET && Math.random() < JUMP * speed) {
+        const X = x + Math.round((Math.random() * 2 - 1) * JUMP_R), Y = y + Math.round((Math.random() * 2 - 1) * JUMP_R);
+        if (X >= 0 && Y >= 0 && X < GW && Y < GH && mat[Y * GW + X] === MAT_TEXT) ignite(Y * GW + X);
+      }
     }
     for (const i of fresh) next.push(i);
     fresh = [];
@@ -402,16 +467,21 @@
     mode = m;
     $('mSheet').classList.toggle('on', m === 'sheet');
     $('mFuse').classList.toggle('on', m === 'fuse');
-    $('hint').textContent = m === 'sheet'
-      ? '클릭: 불 붙이기 · 휠 버튼 드래그: 종이 돌리기 · R: 리셋'
-      : '아래쪽 끝의 파란 띠에 불을 붙이면 오르막을 타고 스마일맨까지 갑니다.';
+    $('mText').classList.toggle('on', m === 'text');
+    $('textRow').hidden = m !== 'text';
+    $('hint').textContent = {
+      sheet: '클릭: 불 붙이기 · 휠 버튼 드래그: 종이 돌리기 · R: 리셋',
+      fuse: '아래쪽 끝의 파란 띠에 불을 붙이면 오르막을 타고 스마일맨까지 갑니다.',
+      text: '글자를 입력하고 적용 → 왼쪽 아래 파란 도화선에 불을 붙이세요.',
+    }[m];
     build();
   }
   $('mSheet').onclick = () => setMode('sheet');
   $('mFuse').onclick = () => setMode('fuse');
+  $('mText').onclick = () => setMode('text');
   $('reset').onclick = () => build();
   $('light').onclick = () => {
-    if (mode === 'fuse') igniteNear(fuseStart.x + 4, fuseStart.y - 2, 10);
+    if (mode !== 'sheet') igniteNear(fuseStart.x + 4, fuseStart.y - 2, 10);
     else {
       const lit = [];
       for (let i = 0; i < mat.length; i++) if (mat[i] && !state[i]) lit.push(i);
@@ -424,7 +494,13 @@
   };
   speed = +$('speed').value;
   $('speed').oninput = e => { speed = +e.target.value; updateProb(); };
-  addEventListener('keydown', e => { if (e.key === 'r' || e.key === 'R') build(); });
+  addEventListener('keydown', e => {
+    if (e.target === $('txt')) return;                    // typing an R shouldn't reset
+    if (e.key === 'r' || e.key === 'R') build();
+  });
+  const applyText = () => { fuseText = $('txt').value; build(); $('txt').blur(); };
+  $('apply').onclick = applyText;
+  $('txt').addEventListener('keydown', e => { if (e.key === 'Enter') applyText(); });
   addEventListener('resize', resize);
 
   // ---------- frame ----------
