@@ -1,0 +1,527 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Flash Paper Fire</title>
+<style>
+  :root {
+    --bg: #0b0f16;
+    --panel: rgba(16, 22, 32, 0.78);
+    --text: #e8edf4;
+    --muted: #9aa6b6;
+    --accent: #ffb43c;
+    --line: rgba(255, 255, 255, 0.12);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); color: var(--text);
+    font: 14px/1.4 system-ui, -apple-system, "Segoe UI", "Malgun Gothic", sans-serif; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; cursor: crosshair; touch-action: none; }
+  #ui { position: fixed; top: 16px; left: 16px; right: 16px; max-width: 360px; padding: 14px 16px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px; backdrop-filter: blur(6px); }
+  h1 { margin: 0 0 4px; font-size: 16px; font-weight: 650; }
+  p { margin: 0 0 10px; color: var(--muted); font-size: 13px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+  button { flex: 1 1 auto; padding: 7px 10px; border-radius: 8px; border: 1px solid var(--line);
+    background: rgba(255,255,255,0.06); color: var(--text); font: inherit; cursor: pointer; }
+  button:hover { background: rgba(255,255,255,0.12); }
+  button.on { border-color: var(--accent); color: var(--accent); }
+  label { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 13px; }
+  input[type=range] { flex: 1; accent-color: var(--accent); }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="ui">
+  <h1>Flash Paper</h1>
+  <p id="hint">클릭: 불 붙이기 · 휠 버튼 드래그: 종이 돌리기 · R: 리셋</p>
+  <div class="row">
+    <button id="mSheet" class="on">플래시 페이퍼</button>
+    <button id="mFuse">도화선 → 스마일맨</button>
+  </div>
+  <div class="row">
+    <button id="light">불 붙이기</button>
+    <button id="reset">리셋</button>  </div>
+  <label>속도 <input id="speed" type="range" min="0.3" max="2.5" step="0.05" value="1" autocomplete="off"></label>
+</div>
+<script>
+(() => {
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+  const bg = document.createElement('canvas');           // static scene (room, plank)
+  const bgx = bg.getContext('2d');
+  const paper = document.createElement('canvas');        // burnable cells, 1px per cell
+  const px = paper.getContext('2d');
+  const flame = document.createElement('canvas');        // heat field rendered through the fire palette
+  const fx = flame.getContext('2d');
+  const bloom = document.createElement('canvas');        // blurred low-res copy of the flame
+  const blx = bloom.getContext('2d');
+
+  const CS = 3;                 // paper cell size in CSS px
+  const FS = 5;                 // heat-field cell size in CSS px
+  const H_STEP = 1 / 480;       // fixed CA step
+  const TIME_SCALE = +new URLSearchParams(location.search).get('slow') || 1;   // ?slow=0.2 for slow motion
+  const MAT_SHEET = 1, MAT_STRIP = 2;
+  // spread rate (ignitions/sec per neighbour) and burn duration per material
+  const RATE = [0, 300, 30];
+  const DUR = [0, 0.10, 0.24];
+  // heat injected into the field per burning paper cell per second
+  const INJECT = [0, 10, 30];
+  // flame gas: rise speed (field cells/s), base cooling and noise-driven cooling (heat/s)
+  const RISE = 120, COOL_BASE = 0.9, COOL_NOISE = 9, HEAT_MAX = 2.6;
+
+  let W, H, DPR, GW, GH, FW, FH;
+  let mat, state, timer, dur, flam, img, pix32;
+  let heat, heat2, fimg, f32;
+  let active = [], fresh = [];
+  let mode = 'sheet', speed = 1, time = 0;
+  let fuseStart = null;
+  // paper grid lives in its own frame: world = centre + R(ang) * (local - pivot)
+  const sheet = { cx: 0, cy: 0, pivX: 0, pivY: 0, ang: 0, spin: 0 };
+  function toWorld(x, y) {
+    const c = Math.cos(sheet.ang), s = Math.sin(sheet.ang), dx = x - sheet.pivX, dy = y - sheet.pivY;
+    return [sheet.cx + dx * c - dy * s, sheet.cy + dx * s + dy * c];
+  }
+  function toLocal(x, y) {
+    const c = Math.cos(sheet.ang), s = Math.sin(sheet.ang), dx = x - sheet.cx, dy = y - sheet.cy;
+    return [sheet.pivX + dx * c + dy * s, sheet.pivY - dx * s + dy * c];
+  }
+  let light = 0, lx = 0, ly = 0, heatSum = 0;
+
+  // ---------- palette: heat -> premultiplied colour for additive blending ----------
+  const STOPS = [          // t = heat / HEAT_MAX
+    [0.00, 0, 0, 0], [0.08, 80, 10, 2], [0.22, 190, 45, 8], [0.42, 250, 110, 18],
+    [0.65, 255, 175, 50], [0.85, 255, 225, 120], [1.00, 255, 250, 225],
+  ];
+  const LUT = new Uint32Array(256);
+  for (let k = 0; k < 256; k++) {
+    const t = k / 255;
+    let c = STOPS[STOPS.length - 1].slice(1);
+    for (let s = 1; s < STOPS.length; s++) {
+      if (t <= STOPS[s][0]) {
+        const a = STOPS[s - 1], b = STOPS[s], u = (t - a[0]) / (b[0] - a[0]);
+        c = [1, 2, 3].map(j => a[j] + (b[j] - a[j]) * u);
+        break;
+      }
+    }
+    LUT[k] = rgba(c[0] | 0, c[1] | 0, c[2] | 0, 255);
+  }
+
+  // ---------- helpers ----------
+  function rgba(r, g, b, a = 255) { return ((a << 24) | (b << 16) | (g << 8) | r) >>> 0; }
+  const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+
+  // multi-octave value noise in [0,1]
+  function valueNoise(w, h, octaves, wrap) {
+    const acc = new Float32Array(w * h);
+    let total = 0;
+    for (const [cell, amp] of octaves) {
+      const cw = Math.ceil(w / cell) + 1, ch = Math.ceil(h / cell) + 1;
+      const r = Float32Array.from({ length: cw * ch }, Math.random);
+      const at = (x, y) => wrap ? r[(y % (ch - 1)) * cw + (x % (cw - 1))] : r[y * cw + x];
+      for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+        const gx = x / cell, gy = y / cell, x0 = gx | 0, y0 = gy | 0;
+        const tx = gx - x0, ty = gy - y0, sx = tx * tx * (3 - 2 * tx), sy = ty * ty * (3 - 2 * ty);
+        const a = at(x0, y0), b = at(x0 + 1, y0), c = at(x0, y0 + 1), d = at(x0 + 1, y0 + 1);
+        acc[y * w + x] += amp * (a + (b - a) * sx + (c - a + (a - b + d - c) * sx) * sy);
+      }
+      total += amp;
+    }
+    for (let i = 0; i < acc.length; i++) acc[i] /= total;
+    return acc;
+  }
+
+  // tiling cooling texture that scrolls up with the gas: uneven cooling carves the heat into flame tongues
+  const CT = 128;
+  const cool = valueNoise(CT, CT, [[16, 0.5], [8, 0.3], [4, 0.2]], true);
+  for (let i = 0; i < cool.length; i++) cool[i] = Math.pow(cool[i], 2.2) * 2.2;
+
+  // ---------- setup ----------
+  function resize() {
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    W = innerWidth; H = innerHeight;
+    canvas.width = W * DPR; canvas.height = H * DPR;
+    bg.width = W * DPR; bg.height = H * DPR;
+    FW = Math.ceil(W / FS); FH = Math.ceil(H / FS);
+    flame.width = FW; flame.height = FH;
+    bloom.width = Math.ceil(FW / 2); bloom.height = Math.ceil(FH / 2);
+    build();
+  }
+
+  const FL = 8;   // flammability levels
+  function build() {
+    // sheet mode: a small grid just around the sheet, spun around its centre; fuse mode: whole screen, fixed
+    const side = Math.min(W * 0.8, H * 0.55, 440);
+    if (mode === 'sheet') {
+      sheet.size = side;
+      GW = Math.ceil(side / CS) + 4; GH = Math.ceil(side * 0.8 / CS) + 4;
+      sheet.pivX = GW * CS / 2; sheet.pivY = GH * CS / 2;
+      sheet.cx = W / 2; sheet.cy = H * 0.56; sheet.ang = -0.32; sheet.spin = 0;
+    } else {
+      GW = Math.ceil(W / CS); GH = Math.ceil(H / CS);
+      sheet.pivX = sheet.pivY = sheet.cx = sheet.cy = sheet.ang = 0; sheet.spin = 0;
+    }
+    paper.width = GW; paper.height = GH;
+    const N = GW * GH;
+    mat = new Uint8Array(N); state = new Uint8Array(N);
+    timer = new Float32Array(N); dur = new Float32Array(N);
+    img = px.createImageData(GW, GH); pix32 = new Uint32Array(img.data.buffer);
+    const fn = valueNoise(GW, GH, [[18, 0.65], [6, 0.35]], false);
+    flam = new Uint8Array(N);
+    for (let i = 0; i < N; i++) flam[i] = Math.min(FL - 1, fn[i] * FL | 0);
+    heat = new Float32Array(FW * FH); heat2 = new Float32Array(FW * FH);
+    fimg = fx.createImageData(FW, FH); f32 = new Uint32Array(fimg.data.buffer);
+    active = []; fresh = []; light = 0; heatSum = 0;
+    drawRoom();
+    if (mode === 'sheet') buildSheet(); else buildFuse();
+  }
+
+  function setCell(gx, gy, m, color) {
+    if (gx < 1 || gy < 1 || gx >= GW - 1 || gy >= GH - 1) return;
+    const i = gy * GW + gx;
+    mat[i] = m; pix32[i] = color;
+  }
+
+  function buildSheet() {
+    const s = sheet.size;
+    for (let gy = 0; gy < GH; gy++) for (let gx = 0; gx < GW; gx++) {
+      const u = (gx + 0.5) * CS - sheet.pivX, v = (gy + 0.5) * CS - sheet.pivY;
+      if (Math.abs(u) > s / 2 || Math.abs(v) > s * 0.4) continue;
+      let shade = 1 + (Math.random() - 0.5) * 0.06 - (v / s) * 0.12;
+      if (Math.abs(u) < 2.5) shade *= 0.86;           // centre fold
+      else if (u > 0) shade *= 0.95;
+      setCell(gx, gy, MAT_SHEET, rgba(clamp(42 * shade, 0, 255) | 0, clamp(180 * shade, 0, 255) | 0, clamp(232 * shade, 0, 255) | 0));
+    }
+  }
+
+  function buildFuse() {
+    const A = { x: W * 0.1, y: H * 0.86 }, B = { x: W * 0.7, y: H * 0.42 };
+    const card = { w: Math.min(150, W * 0.22), h: Math.min(180, H * 0.28) };
+    card.x = B.x - card.w * 0.2; card.y = B.y - card.h + 10;
+    drawPlank(A, B);
+    // strip along the plank, slightly wobbly edges
+    const dx = B.x - A.x, dy = B.y - A.y, len = Math.hypot(dx, dy), ux = dx / len, uy = dy / len;
+    for (let gy = 0; gy < GH; gy++) for (let gx = 0; gx < GW; gx++) {
+      const qx = (gx + 0.5) * CS - A.x, qy = (gy + 0.5) * CS - A.y;
+      const along = qx * ux + qy * uy, across = -qx * uy + qy * ux;
+      if (along < 0 || along > len + 20) continue;
+      const half = 7 + Math.sin(along * 0.05) * 1.5 + Math.sin(along * 0.17) * 0.8;
+      if (Math.abs(across) > half) continue;
+      const shade = 1 + (Math.random() - 0.5) * 0.08;
+      setCell(gx, gy, MAT_STRIP, rgba(40 * shade | 0, clamp(178 * shade, 0, 255) | 0, clamp(230 * shade, 0, 255) | 0));
+    }
+    fuseStart = A;
+    // stick-man card, drawn in cell space
+    const cw = Math.round(card.w / CS), ch = Math.round(card.h / CS);
+    const s = document.createElement('canvas'); s.width = cw; s.height = ch;
+    const g = s.getContext('2d');
+    g.strokeStyle = '#000'; g.fillStyle = '#000'; g.lineWidth = 1.6; g.lineCap = 'round';
+    const hx = cw / 2, hy = ch * 0.24, hr = cw * 0.16;
+    g.beginPath(); g.arc(hx, hy, hr, 0, Math.PI * 2); g.stroke();
+    g.beginPath(); g.arc(hx, hy + hr * 0.1, hr * 0.55, 0.2 * Math.PI, 0.8 * Math.PI); g.stroke();
+    g.fillRect(hx - hr * 0.45, hy - hr * 0.35, 1.6, 1.6); g.fillRect(hx + hr * 0.3, hy - hr * 0.35, 1.6, 1.6);
+    g.beginPath();
+    g.moveTo(hx, hy + hr); g.lineTo(hx, ch * 0.66);
+    g.moveTo(hx - cw * 0.25, ch * 0.42); g.lineTo(hx, ch * 0.5); g.lineTo(hx + cw * 0.25, ch * 0.36);
+    g.moveTo(hx, ch * 0.66); g.lineTo(hx - cw * 0.18, ch * 0.88);
+    g.moveTo(hx, ch * 0.66); g.lineTo(hx + cw * 0.18, ch * 0.88);
+    g.stroke();
+    const ink = g.getImageData(0, 0, cw, ch).data;
+    const ox = Math.round(card.x / CS), oy = Math.round(card.y / CS);
+    for (let y = 0; y < ch; y++) for (let x = 0; x < cw; x++) {
+      const dark = ink[(y * cw + x) * 4 + 3] > 90;
+      const n = 1 + (Math.random() - 0.5) * 0.05;
+      setCell(ox + x, oy + y, MAT_SHEET, dark ? rgba(30, 30, 36) : rgba(clamp(246 * n, 0, 255) | 0, clamp(242 * n, 0, 255) | 0, clamp(232 * n, 0, 255) | 0));
+    }
+  }
+
+  function drawRoom() {
+    bgx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    const g = bgx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, '#1a2436'); g.addColorStop(1, '#0a0d13');
+    bgx.fillStyle = g; bgx.fillRect(0, 0, W, H);
+    // mottled wall like the video's backdrop
+    for (let k = 0; k < 90; k++) {
+      const x = Math.random() * W, y = Math.random() * H, r = 40 + Math.random() * 160;
+      const rg = bgx.createRadialGradient(x, y, 0, x, y, r);
+      const c = Math.random() < 0.5 ? '70,95,140' : '10,14,22';
+      rg.addColorStop(0, `rgba(${c},0.10)`); rg.addColorStop(1, `rgba(${c},0)`);
+      bgx.fillStyle = rg; bgx.fillRect(x - r, y - r, r * 2, r * 2);
+    }
+  }
+
+  function drawPlank(A, B) {
+    const ang = Math.atan2(B.y - A.y, B.x - A.x), len = Math.hypot(B.x - A.x, B.y - A.y);
+    bgx.save(); bgx.translate(A.x, A.y); bgx.rotate(ang);
+    bgx.fillStyle = 'rgba(0,0,0,0.45)'; bgx.fillRect(-30, -28, len + 110, 74);   // shadow
+    const g = bgx.createLinearGradient(0, -36, 0, 36);
+    g.addColorStop(0, '#c99a5e'); g.addColorStop(0.5, '#b8844a'); g.addColorStop(1, '#94673a');
+    bgx.fillStyle = g; bgx.fillRect(-40, -36, len + 110, 72);
+    bgx.strokeStyle = 'rgba(90,55,25,0.35)'; bgx.lineWidth = 1;
+    for (let k = 0; k < 18; k++) {
+      const y0 = -34 + Math.random() * 68;
+      bgx.beginPath(); bgx.moveTo(-40, y0);
+      for (let x = -40; x < len + 70; x += 20) bgx.lineTo(x, y0 + Math.sin(x * 0.02 + k) * 2.5);
+      bgx.stroke();
+    }
+    bgx.restore();
+  }
+
+  // ---------- burning (cellular automaton on the paper) ----------
+  function ignite(i) {
+    if (state[i] !== 0 || mat[i] === 0) return;
+    state[i] = 1;
+    dur[i] = timer[i] = DUR[mat[i]] * (0.6 + Math.random() * 0.8);
+    fresh.push(i);
+  }
+  function igniteNear(wx, wy, r) {             // world coordinates
+    const [x, y] = toLocal(wx, wy);
+    const gx = Math.floor(x / CS), gy = Math.floor(y / CS), gr = Math.ceil(r / CS);
+    for (let j = -gr; j <= gr; j++) for (let k = -gr; k <= gr; k++) {
+      const X = gx + k, Y = gy + j;
+      if (X < 0 || Y < 0 || X >= GW || Y >= GH || j * j + k * k > gr * gr) continue;
+      ignite(Y * GW + X);
+    }
+  }
+
+  // neighbour offsets with weight (diagonal slower, upward faster: flames climb)
+  const NB = [];
+  for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+    if (!dx && !dy) continue;
+    NB.push({ dx, dy, w: (dx && dy ? 0.6 : 1) * (dy < 0 ? 1.35 : dy > 0 ? 0.75 : 1) });
+  }
+  // prob[material][flammability level][neighbour]
+  let prob = [];
+  function updateProb() {
+    prob = RATE.map(r => Array.from({ length: FL }, (_, l) => {
+      const f = 0.35 + 1.3 * l / (FL - 1);
+      return NB.map(nb => 1 - Math.exp(-r * f * speed * nb.w * H_STEP));
+    }));
+  }
+
+  function step(h) {
+    const next = [];
+    for (let a = 0; a < active.length; a++) {
+      const i = active[a];
+      timer[i] -= h;
+      if (timer[i] <= 0) { state[i] = 2; pix32[i] = 0; continue; }   // gone: no ash
+      next.push(i);
+      const x = i % GW, y = (i / GW) | 0;
+      for (let n = 0; n < 8; n++) {
+        const X = x + NB[n].dx, Y = y + NB[n].dy;
+        if (X < 0 || Y < 0 || X >= GW || Y >= GH) continue;
+        const j = Y * GW + X;
+        if (state[j] === 0 && mat[j] && Math.random() < prob[mat[j]][flam[j]][n]) ignite(j);
+      }
+    }
+    for (const i of fresh) next.push(i);
+    fresh = [];
+    active = next;
+  }
+
+  // ---------- flame gas (heat field) ----------
+  // bilinear splat so the 3px paper grid doesn't alias into stripes on the 5px heat grid
+  function addHeat(x, y, amount) {
+    const gx = x / FS - 0.5, gy = y / FS - 0.5, X = gx | 0, Y = gy | 0;
+    if (X < 1 || Y < 1 || X >= FW - 2 || Y >= FH - 2) return;
+    const tx = gx - X, ty = gy - Y, k = Y * FW + X;
+    heat[k] += amount * (1 - tx) * (1 - ty);
+    heat[k + 1] += amount * tx * (1 - ty);
+    heat[k + FW] += amount * (1 - tx) * ty;
+    heat[k + FW + 1] += amount * tx * ty;
+  }
+
+  // semi-Lagrangian advection upward through a wavering flow, minus uneven cooling
+  function updateHeat(dt) {
+    const scroll = (time * RISE) | 0;
+    const t = time;
+    let sum = 0;
+    for (let y = 0; y < FH; y++) {
+      const row = y * FW;
+      const cy = ((y + scroll) % CT) * CT;
+      for (let x = 0; x < FW; x++) {
+        // horizontal sway: slow big waves plus fast small flicker
+        const u = 22 * Math.sin(y * 0.19 + t * 3.1 + 1.6 * Math.sin(x * 0.08 + t * 0.9))
+                + 10 * Math.sin(y * 0.47 - t * 7.3 + x * 0.29);
+        const sx = x - u * dt, sy = y + RISE * dt;           // gas arrives from below
+        const x0 = sx | 0, y0 = sy | 0;
+        let h = 0;
+        if (x0 >= 0 && y0 >= 0 && x0 < FW - 1 && y0 < FH - 1) {
+          const tx = sx - x0, ty = sy - y0, k = y0 * FW + x0;
+          const a = heat[k], b = heat[k + 1], c = heat[k + FW], d = heat[k + FW + 1];
+          h = a + (b - a) * tx + (c - a + (a - b + d - c) * tx) * ty;
+        }
+        h -= (COOL_BASE + COOL_NOISE * cool[cy + (x % CT)]) * dt;
+        if (h < 0) h = 0; else if (h > HEAT_MAX) h = HEAT_MAX;
+        heat2[row + x] = h; sum += h;
+      }
+    }
+    const tmp = heat; heat = heat2; heat2 = tmp;
+    heatSum = sum;
+  }
+
+  // ---------- input ----------
+  const mouse = { x: 0, y: 0, down: false, held: 0 };
+  // left button = lighter, middle button drag = rotate the sheet around its centre
+  const rot = { on: false, last: 0, t: 0 };
+  const angleAt = e => Math.atan2(e.clientY - sheet.cy, e.clientX - sheet.cx);
+  canvas.addEventListener('pointerdown', e => {
+    canvas.setPointerCapture(e.pointerId);
+    if (e.button === 1) {
+      e.preventDefault();                                   // no autoscroll
+      if (mode !== 'sheet') return;
+      rot.on = true; rot.last = angleAt(e); rot.t = performance.now(); sheet.spin = 0;
+      return;
+    }
+    if (e.button !== 0) return;
+    mouse.down = true; mouse.held = 0; mouse.x = e.clientX; mouse.y = e.clientY;
+    igniteNear(mouse.x, mouse.y, 4);
+  });
+  canvas.addEventListener('pointermove', e => {
+    mouse.x = e.clientX; mouse.y = e.clientY;
+    if (!rot.on) return;
+    const a = angleAt(e), now = performance.now();
+    let d = a - rot.last;
+    if (d > Math.PI) d -= 2 * Math.PI; else if (d < -Math.PI) d += 2 * Math.PI;
+    sheet.ang += d;
+    const dtm = Math.max(1, now - rot.t) / 1000;
+    sheet.spin = sheet.spin * 0.6 + (d / dtm) * 0.4;        // smoothed angular velocity for the coast
+    rot.last = a; rot.t = now;
+  });
+  const release = e => {
+    if (e.button === 1 || rot.on) { rot.on = false; if (performance.now() - rot.t > 80) sheet.spin = 0; }
+    if (e.button === 0) mouse.down = false;
+  };
+  canvas.addEventListener('pointerup', release);
+  canvas.addEventListener('pointercancel', () => { mouse.down = false; rot.on = false; });
+  canvas.addEventListener('mousedown', e => { if (e.button === 1) e.preventDefault(); });
+  canvas.addEventListener('auxclick', e => e.preventDefault());
+
+  const $ = id => document.getElementById(id);
+  function setMode(m) {
+    mode = m;
+    $('mSheet').classList.toggle('on', m === 'sheet');
+    $('mFuse').classList.toggle('on', m === 'fuse');
+    $('hint').textContent = m === 'sheet'
+      ? '클릭: 불 붙이기 · 휠 버튼 드래그: 종이 돌리기 · R: 리셋'
+      : '아래쪽 끝의 파란 띠에 불을 붙이면 오르막을 타고 스마일맨까지 갑니다.';
+    build();
+  }
+  $('mSheet').onclick = () => setMode('sheet');
+  $('mFuse').onclick = () => setMode('fuse');
+  $('reset').onclick = () => build();
+  $('light').onclick = () => {
+    if (mode === 'fuse') igniteNear(fuseStart.x + 4, fuseStart.y - 2, 10);
+    else {
+      const lit = [];
+      for (let i = 0; i < mat.length; i++) if (mat[i] && !state[i]) lit.push(i);
+      if (lit.length) {
+        const i = lit[lit.length - 1 - ((Math.random() * lit.length * 0.05) | 0)];
+        const [x, y] = toWorld((i % GW + 0.5) * CS, (((i / GW) | 0) + 0.5) * CS);
+        igniteNear(x, y, 6);
+      }
+    }
+  };
+  speed = +$('speed').value;
+  $('speed').oninput = e => { speed = +e.target.value; updateProb(); };
+  addEventListener('keydown', e => { if (e.key === 'r' || e.key === 'R') build(); });
+  addEventListener('resize', resize);
+
+  // ---------- frame ----------
+  let last = performance.now(), acc = 0;
+  function frame(now) {
+    const dt = Math.min(0.05, (now - last) / 1000) * TIME_SCALE; last = now; time += dt;
+
+    // lighter: held pointer is a small flame that ignites paper under its tip
+    if (mouse.down) {
+      mouse.held += dt;
+      for (let k = -1; k <= 1; k++) addHeat(mouse.x + k * FS * 0.6, mouse.y - 4, 30 * dt);
+      if (mouse.held > 0.08 && Math.random() < 0.5) igniteNear(mouse.x, mouse.y - 6, 4);
+    }
+
+    // after a middle-drag is released the sheet coasts and slows down
+    if (mode === 'sheet' && !rot.on && sheet.spin) {
+      sheet.ang += sheet.spin * dt;
+      sheet.spin *= Math.pow(0.04, dt);
+      if (Math.abs(sheet.spin) < 0.01) sheet.spin = 0;
+    }
+
+    acc += dt;
+    let steps = 0;
+    while (acc >= H_STEP && steps < 40) { step(H_STEP); acc -= H_STEP; steps++; }
+
+    // burning paper feeds heat into the gas; also measure light
+    let sx = 0, sy = 0, lum = 0;
+    for (let a = 0; a < active.length; a++) {
+      const i = active[a], m = mat[i];
+      const [x, y] = toWorld((i % GW + 0.5) * CS, (((i / GW) | 0) + 0.5) * CS);
+      addHeat(x, y, INJECT[m] * dt);
+      const w = m === MAT_SHEET ? 1 : 3;
+      lum += w; sx += x * w; sy += y * w;
+      // a burning cell glows briefly as it's consumed, then disappears
+      const f = timer[i] / dur[i];
+      pix32[i] = rgba(255, (170 + 70 * f) | 0, (60 + 120 * f) | 0, (200 * f * f) | 0);
+    }
+    if (lum > 0) { lx = sx / lum; ly = sy / lum; }
+    const target = Math.min(1, lum * CS * CS / 40000);
+    light += (target - light) * Math.min(1, dt * (target > light ? 14 : 3));
+
+    if (heatSum > 0.01 || active.length || mouse.down) updateHeat(dt);
+
+    // ---- render ----
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.globalCompositeOperation = 'source-over'; ctx.globalAlpha = 1;
+    ctx.drawImage(bg, 0, 0);
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+    px.putImageData(img, 0, 0);
+    ctx.imageSmoothingEnabled = true;
+    ctx.save();
+    ctx.translate(sheet.cx, sheet.cy); ctx.rotate(sheet.ang);
+    ctx.drawImage(paper, -sheet.pivX, -sheet.pivY, GW * CS, GH * CS);
+    ctx.restore();
+
+    ctx.globalCompositeOperation = 'lighter';
+    // ambient light thrown by the fire on the surroundings
+    if (light > 0.01) {
+      const R = 200 + light * Math.max(W, H) * 0.8;
+      const g = ctx.createRadialGradient(lx, ly, 0, lx, ly, R);
+      g.addColorStop(0, `rgba(255,170,90,${Math.min(0.25, light * 0.25)})`);
+      g.addColorStop(0.35, `rgba(255,110,30,${Math.min(0.1, light * 0.1)})`);
+      g.addColorStop(1, 'rgba(255,80,20,0)');
+      ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+    }
+    if (heatSum > 0.01) {
+      const scale = 255 / HEAT_MAX;
+      for (let k = 0; k < heat.length; k++) {
+        const h = heat[k];
+        f32[k] = h > 0.004 ? LUT[Math.min(255, (h * scale) | 0)] : 0;
+      }
+      fx.putImageData(fimg, 0, 0);
+      // bloom: soft halo around the flame
+      blx.clearRect(0, 0, bloom.width, bloom.height);
+      blx.filter = 'blur(3px)';
+      blx.drawImage(flame, 0, 0, bloom.width, bloom.height);
+      blx.filter = 'none';
+      ctx.globalAlpha = 0.7;
+      ctx.drawImage(bloom, 0, 0, FW * FS, FH * FS);
+      ctx.globalAlpha = 1;
+      ctx.drawImage(flame, 0, 0, FW * FS, FH * FS);
+    }
+    // brief camera overexposure at the peak of a big flash
+    if (light > 0.6) {
+      ctx.globalAlpha = Math.min(0.18, (light - 0.6) * 0.45);
+      ctx.fillStyle = '#fff2d8'; ctx.fillRect(0, 0, W, H);
+    }
+    ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
+
+    requestAnimationFrame(frame);
+  }
+
+  updateProb();
+  resize();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
